@@ -11,8 +11,11 @@ use oasgen::{oasgen, OaSchema};
 use screenpipe_db::OutputRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use super::content::PaginationInfo;
@@ -23,6 +26,9 @@ use crate::server::AppState;
 // (see screenpipe-db OutputRecord); everything HTTP-facing says "artifacts".
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
+const MAX_INDEXED_TEXT_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+const SEARCH_BACKFILL_BATCH: u32 = 100;
+const SEARCH_BACKFILL_PAUSE: Duration = Duration::from_millis(250);
 const PREVIEW_BYTES: usize = 256;
 
 /// Fallback discovery cap: pipes without explicit `artifacts:` declarations
@@ -149,6 +155,94 @@ async fn read_preview(path: &std::path::Path, kind: &str) -> Option<String> {
     let mut buf = vec![0u8; PREVIEW_BYTES];
     let n = reader.read(&mut buf).await.ok()?;
     std::str::from_utf8(&buf[..n]).ok().map(|s| s.to_string())
+}
+
+fn is_text_searchable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "markdown" | "text" | "json" | "csv" | "tsv" | "saf" | "code"
+    )
+}
+
+async fn read_search_body(
+    path: &std::path::Path,
+    kind: &str,
+    title: &str,
+) -> Option<(String, i64, String)> {
+    if !is_text_searchable_kind(kind) {
+        return None;
+    }
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = Vec::with_capacity(MAX_INDEXED_TEXT_BYTES.min(1024 * 1024) as usize);
+    let mut limited = file.take(MAX_INDEXED_TEXT_BYTES);
+    limited.read_to_end(&mut buf).await.ok()?;
+    if buf.iter().take(8192).any(|b| *b == 0) {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&buf).to_string();
+    let mut hasher = DefaultHasher::new();
+    title.hash(&mut hasher);
+    body.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    Some((body, buf.len() as i64, hash))
+}
+
+async fn index_output_record_for_search(
+    db: &screenpipe_db::DatabaseManager,
+    record: &OutputRecord,
+) {
+    let path = std::path::Path::new(&record.output_path);
+    if let Some((body, bytes_indexed, content_hash)) =
+        read_search_body(path, &record.kind, &record.title).await
+    {
+        if let Err(e) = db
+            .upsert_output_search_document(
+                record.id,
+                &record.title,
+                &body,
+                &record.source,
+                &record.source_type,
+                &record.kind,
+                &content_hash,
+                bytes_indexed,
+            )
+            .await
+        {
+            tracing::warn!("failed to index artifact {} for search: {}", record.id, e);
+        }
+    } else if let Err(e) = db.delete_output_search_document(record.id).await {
+        tracing::warn!(
+            "failed to clear artifact {} search document: {}",
+            record.id,
+            e
+        );
+    }
+}
+
+pub fn spawn_artifact_search_backfill(db: Arc<screenpipe_db::DatabaseManager>) {
+    tokio::spawn(async move {
+        loop {
+            let rows = match db
+                .list_outputs_missing_search_documents(SEARCH_BACKFILL_BATCH)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("failed to list artifacts missing search index: {}", e);
+                    return;
+                }
+            };
+            if rows.is_empty() {
+                return;
+            }
+            let indexed = rows.len();
+            for row in rows {
+                index_output_record_for_search(&db, &row).await;
+            }
+            tracing::debug!("artifact search backfill indexed {} artifacts", indexed);
+            tokio::time::sleep(SEARCH_BACKFILL_PAUSE).await;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +625,28 @@ pub(crate) async fn register_artifact_handler(
             JsonResponse(json!({"error": e.to_string()})),
         )
     })?;
+    if let Some((body, bytes_indexed, content_hash)) =
+        read_search_body(&dest, kind, &record.title).await
+    {
+        if let Err(e) = state
+            .db
+            .upsert_output_search_document(
+                id,
+                &record.title,
+                &body,
+                &record.source,
+                &record.source_type,
+                &record.kind,
+                &content_hash,
+                bytes_indexed,
+            )
+            .await
+        {
+            tracing::warn!("failed to index artifact {} for search: {}", id, e);
+        }
+    } else if let Err(e) = state.db.delete_output_search_document(id).await {
+        tracing::warn!("failed to clear artifact {} search document: {}", id, e);
+    }
     Ok(JsonResponse(record_to_response(record)))
 }
 
@@ -659,16 +775,33 @@ pub(crate) async fn list_artifacts_handler(
     let limit = params.limit.min(ARTIFACTS_LIMIT_MAX);
 
     // Registered outputs from the DB.
-    let rows = state
-        .db
-        .list_outputs(None, None, None, 10_000, 0)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({"error": e.to_string()})),
-            )
-        })?;
+    let registered_fetch_limit = params.offset.saturating_add(limit).min(ARTIFACTS_LIMIT_MAX);
+    let source_filter = params.source.as_deref().filter(|s| !s.is_empty());
+    let saf_kind_filter = params.saf_kind.as_deref().filter(|s| !s.is_empty());
+    let q_filter = params.q.as_deref().filter(|q| !q.trim().is_empty());
+    let (rows, registered_total) = if let Some(q) = q_filter {
+        state
+            .db
+            .search_outputs(q, source_filter, saf_kind_filter, registered_fetch_limit, 0)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?
+    } else {
+        state
+            .db
+            .list_outputs_for_artifacts(source_filter, saf_kind_filter, registered_fetch_limit, 0)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?
+    };
 
     let mut registered_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut items: Vec<ArtifactItem> = Vec::with_capacity(rows.len());
@@ -767,27 +900,30 @@ pub(crate) async fn list_artifacts_handler(
             i.source.clone()
         }
     };
-    let mut sources: Vec<String> = items
-        .iter()
-        .map(&display_source)
-        .collect::<std::collections::HashSet<_>>()
+    let mut source_set: std::collections::HashSet<String> = state
+        .db
+        .list_output_sources_for_artifacts()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?
         .into_iter()
         .collect();
+    source_set.extend(items.iter().map(&display_source));
+    let mut sources: Vec<String> = source_set.into_iter().collect();
     sources.sort();
 
-    if let Some(src) = params.source.as_deref().filter(|s| !s.is_empty()) {
-        items.retain(|i| display_source(i) == src);
+    if let Some(src) = source_filter {
+        items.retain(|i| i.registered || display_source(i) == src);
     }
-    if let Some(sk) = params.saf_kind.as_deref().filter(|s| !s.is_empty()) {
-        items.retain(|i| i.saf_kind.as_deref() == Some(sk));
+    if let Some(sk) = saf_kind_filter {
+        items.retain(|i| i.registered || i.saf_kind.as_deref() == Some(sk));
     }
-    if let Some(q) = params
-        .q
-        .as_deref()
-        .map(str::to_lowercase)
-        .filter(|q| !q.is_empty())
-    {
-        items.retain(|i| artifact_matches_query(i, &q));
+    if let Some(q) = q_filter.map(str::to_lowercase) {
+        items.retain(|i| i.registered || artifact_matches_query(i, &q));
     }
 
     // Newest first by parsed instant — sources emit different UTC offsets,
@@ -800,7 +936,8 @@ pub(crate) async fn list_artifacts_handler(
         )
     });
 
-    let total = items.len() as i64;
+    let derived_total = items.iter().filter(|i| !i.registered).count() as i64;
+    let total = registered_total + derived_total;
     let data: Vec<ArtifactItem> = items
         .into_iter()
         .skip(params.offset as usize)
@@ -945,7 +1082,7 @@ pub async fn auto_register_pipe_artifacts(
             }
         }
 
-        match existing {
+        let registered_id = match existing {
             Some(existing) => {
                 if let Err(e) = db
                     .update_output(
@@ -967,6 +1104,7 @@ pub async fn auto_register_pipe_artifacts(
                         pipe_name,
                         e
                     );
+                    None
                 } else if existing.output_path != dest_str {
                     // Artifact-id matched a row registered under a different
                     // filename: repoint it at the latest file, no dup row.
@@ -978,10 +1116,13 @@ pub async fn auto_register_pipe_artifacts(
                             e
                         );
                     }
+                    Some(existing.id)
+                } else {
+                    Some(existing.id)
                 }
             }
             None => {
-                if let Err(e) = db
+                match db
                     .insert_output(
                         &artifact_source,
                         artifact_source_type,
@@ -998,12 +1139,50 @@ pub async fn auto_register_pipe_artifacts(
                     )
                     .await
                 {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!(
+                            "auto-register: failed to insert output for pipe '{}': {}",
+                            pipe_name,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        if let Some(id) = registered_id {
+            if let Some((body, bytes_indexed, content_hash)) =
+                read_search_body(&dest, kind, title).await
+            {
+                if let Err(e) = db
+                    .upsert_output_search_document(
+                        id,
+                        title,
+                        &body,
+                        &artifact_source,
+                        artifact_source_type,
+                        kind,
+                        &content_hash,
+                        bytes_indexed,
+                    )
+                    .await
+                {
                     tracing::warn!(
-                        "auto-register: failed to insert output for pipe '{}': {}",
+                        "auto-register: failed to index output {} for pipe '{}': {}",
+                        id,
                         pipe_name,
                         e
                     );
                 }
+            } else if let Err(e) = db.delete_output_search_document(id).await {
+                tracing::warn!(
+                    "auto-register: failed to clear output {} search document for pipe '{}': {}",
+                    id,
+                    pipe_name,
+                    e
+                );
             }
         }
     }
